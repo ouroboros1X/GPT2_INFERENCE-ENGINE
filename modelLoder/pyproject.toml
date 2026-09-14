@@ -1,0 +1,20 @@
+[project]
+name = "modelloder"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "ouroboros1X", email = "devs.ouroboros@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.14.0",
+    "transformers>=5.17.0",
+]
+
+[project.scripts]
+modelloder = "modelloder:main"
+
+[build-system]
+requires = ["uv_build>=0.12.6,<0.13.0"]
+build-backend = "uv_build"
