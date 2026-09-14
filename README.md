@@ -114,6 +114,3 @@ GPT2_PYTHON=python3.11 ./gpt2_infer
 - **Tokenization depends on an external Python process** — encode/decode round-trip through `/tmp` files and a `python3 -c ...` subprocess call rather than an in-process tokenizer.
 - **Hardcoded to GPT-2 124M** — model dimensions are compile-time constants, so other GPT-2 sizes (medium/large/XL) would need the constants changed and would need their weights exported in the same layout.
 
-## License
-
-Add your preferred license here.
