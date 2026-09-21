@@ -2434,5 +2434,3 @@ inference bottlenecks
 KV-cache design
 
 The implementation intentionally keeps these concepts visible instead of hiding them behind a framework.
-
-License
