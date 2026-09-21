@@ -1,1199 +1,337 @@
-# GPT-2 CPU Inference Engine
+GPT-2 CPU Inference Engine
 
-A **from-scratch C++17 inference engine for GPT-2 Small (124M)** that executes the complete Transformer forward pass directly on the CPU.
+A from-scratch C++17 implementation of GPT-2 Small (124M) inference that executes the Transformer forward pass directly on the CPU.
 
-The project intentionally avoids high-level machine-learning frameworks such as **PyTorch, TensorFlow, and ONNX Runtime**. Core neural-network operations are implemented manually in C++, including matrix multiplication, LayerNorm, multi-head causal self-attention, GELU, softmax, residual connections, and vocabulary projection.
+This project deliberately avoids high-level machine-learning runtimes such as PyTorch, TensorFlow, and ONNX Runtime for the model computation. Core operations are implemented manually in C++, including:
 
-The goal is to make the complete inference pipeline explicit:
+token and positional embeddings
 
-> **Text → Tokens → Embeddings → Transformer Blocks → Logits → Next Token → Generated Text**
+matrix multiplication / linear layers
 
-Rather than hiding inference behind a framework, this project exposes the individual computations that turn a sequence of tokens into the next-token prediction.
-
----
-
-## Overview
-
-GPT-2 is an autoregressive Transformer language model. During inference, it receives a sequence of tokens and estimates the probability of every possible next token.
-
-For example:
-
-```text
-Input:
-The quick brown
-
-Model:
-GPT-2
-
-Output distribution:
-fox       → highest score
-dog       → lower score
-cat       → lower score
-...
-```
-
-The engine selects the next token using **greedy decoding**, appends it to the sequence, and runs inference again:
-
-```text
-The quick brown
-        ↓
-     predict
-        ↓
-       fox
-        ↓
-The quick brown fox
-        ↓
-     predict
-        ↓
-      jumps
-        ↓
-The quick brown fox jumps
-        ↓
-       ...
-```
-
-This autoregressive process continues until the requested number of tokens has been generated.
-
----
-
-# What This Project Actually Does
-
-It is useful to distinguish between **training** and **inference**.
-
-During training, a neural network learns its parameters:
-
-```text
-Training Data
-     ↓
-Tokenizer
-     ↓
-Token IDs
-     ↓
-Transformer
-     ↓
-Predictions
-     ↓
-Loss
-     ↓
-Backpropagation
-     ↓
-Updated Weights
-```
-
-This project does **not** train GPT-2.
-
-Instead, it takes an already-trained GPT-2 checkpoint and performs the forward computation:
-
-```text
-Prompt
-  ↓
-Tokenizer
-  ↓
-Token IDs
-  ↓
-Embedding lookup
-  ↓
-12 Transformer blocks
-  ↓
-Final LayerNorm
-  ↓
-Vocabulary projection
-  ↓
-Logits for 50,257 tokens
-  ↓
-Greedy argmax
-  ↓
-Next token
-  ↓
-Repeat
-```
-
-In other words, the project functions as a small, specialized **neural-network inference runtime** for GPT-2 Small.
-
----
-
-# Why Build an Inference Engine From Scratch?
-
-Modern ML frameworks make model inference extremely convenient, but they also hide many of the operations occurring inside a Transformer.
-
-For example, a framework may reduce an entire attention calculation to a few high-level API calls.
-
-This project intentionally removes that abstraction.
-
-Instead of:
-
-```python
-model(input)
-```
-
-the implementation explicitly performs the underlying operations:
-
-```text
-Embedding
-    ↓
-Linear projection
-    ↓
-Q / K / V
-    ↓
-Attention scores
-    ↓
-Scaling
-    ↓
-Causal masking
-    ↓
-Softmax
-    ↓
-Weighted value aggregation
-    ↓
-Output projection
-    ↓
-Residual connection
-    ↓
 LayerNorm
-    ↓
-MLP
-    ↓
+
+multi-head causal self-attention
+
+softmax
+
 GELU
-    ↓
-Residual connection
-```
-
-This makes the implementation useful for understanding:
-
-* Transformer architecture
-* GPT-2 internals
-* tensor operations
-* autoregressive generation
-* attention mechanisms
-* model weights
-* CPU inference
-* numerical computation
-* memory layout
-* performance bottlenecks
-
----
-
-# Architecture
-
-GPT-2 Small uses the following configuration:
-
-| Parameter              |                 Value |
-| ---------------------- | --------------------: |
-| Parameters             |                 ~124M |
-| Vocabulary             |                50,257 |
-| Hidden size            |                   768 |
-| Transformer layers     |                    12 |
-| Attention heads        |                    12 |
-| Head dimension         |                    64 |
-| MLP hidden size        |                 3,072 |
-| Maximum context length |                 1,024 |
-| Activation             |                  GELU |
-| Attention              | Causal self-attention |
-
-The model can be viewed as:
-
-```text
-                    Input Text
-                        │
-                        ▼
-                  GPT-2 Tokenizer
-                        │
-                        ▼
-                    Token IDs
-                        │
-                        ▼
-              Token Embedding (WTE)
-                        │
-                        +
-              Position Embedding (WPE)
-                        │
-                        ▼
-             ┌─────────────────────┐
-             │ Transformer Block 0  │
-             └─────────────────────┘
-                        │
-                        ▼
-             ┌─────────────────────┐
-             │ Transformer Block 1  │
-             └─────────────────────┘
-                        │
-                       ...
-                        │
-                        ▼
-             ┌─────────────────────┐
-             │ Transformer Block 11 │
-             └─────────────────────┘
-                        │
-                        ▼
-                 Final LayerNorm
-                        │
-                        ▼
-               Vocabulary Projection
-                        │
-                        ▼
-                 50,257 Logits
-                        │
-                        ▼
-                    Argmax
-                        │
-                        ▼
-                  Next Token
-```
 
----
+residual connections
 
-# End-to-End Inference Pipeline
+vocabulary projection
 
-## 1. Text Input
+greedy decoding
 
-The process starts with ordinary text:
+The result is a small, transparent inference runtime where the reader can follow the path from a text prompt all the way to the next predicted token.
 
-```text
-The quick brown fox
-```
+Text → Token IDs → Embeddings → Transformer Blocks → Logits → Argmax → Next Token → Repeat
 
-The model cannot directly operate on strings.
+Table of Contents
 
-It first needs a sequence of integer token IDs.
+Project Goals
 
----
+What Is an Inference Engine?
 
-## 2. Tokenization
+Model Architecture
 
-GPT-2 uses a byte-level BPE tokenizer.
+End-to-End Data Flow
 
-For example, a sentence may be converted into something conceptually similar to:
+Repository Layout
 
-```text
-"The quick brown fox"
+Codebase at a Glance
 
-        ↓
+Code Walkthrough
 
-[464, 2068, 7586, 21831]
-```
+1. Model Constants and Tensor Representation
 
-The exact IDs depend on GPT-2's tokenizer vocabulary and merge rules.
+2. Loading Tensor Weights
 
-This implementation deliberately does not reimplement the full BPE algorithm in C++.
+3. Representing a Transformer Block
 
-Instead, it invokes the Hugging Face `tokenizers` library through Python so tokenization and decoding remain compatible with the reference GPT-2 tokenizer.
+4. Representing and Loading GPT-2
 
-The C++ engine therefore receives token IDs such as:
+5. LayerNorm
 
-```text
-[464, 2068, 7586, ...]
-```
+6. Linear Layers
 
-These IDs become the input to the neural network.
+7. GELU
 
----
+8. Softmax
 
-# 3. Token Embeddings
+9. Multi-Head Causal Self-Attention
 
-A token ID is simply an integer.
+10. The MLP
 
-The Transformer needs a vector representation.
+11. One Transformer Block
 
-GPT-2 therefore maintains a token embedding matrix:
+12. The Full Forward Pass
 
-```text
-WTE ∈ R^(50257 × 768)
-```
+13. Vocabulary Projection
 
-Each of the 50,257 vocabulary entries has a 768-dimensional vector.
+14. Greedy Decoding
 
-For a token with ID `t`:
+15. Tokenizer Integration
 
-```text
-embedding = WTE[t]
-```
+16. Token Display
 
-So if:
+17. Interactive Generation Loop
 
-```text
-token_id = 464
-```
+Tensor Shapes
 
-the engine retrieves row `464` from the embedding matrix.
+Weight File Mapping
 
-The result is:
+Numerical Details
 
-```text
-768 floating-point values
-```
+Generation and Context Management
 
-That vector is the numerical representation of the token.
+Build
 
----
+Run
 
-# 4. Positional Embeddings
+Requirements
 
-Transformers do not inherently know where a token appears in a sequence.
+Example
 
-GPT-2 therefore also contains a positional embedding matrix:
+Performance
 
-```text
-WPE ∈ R^(1024 × 768)
-```
+Limitations
 
-For token position `p`:
+Future Work
 
-```text
-position_embedding = WPE[p]
-```
+Design Decisions
 
-The token and position representations are added:
+Troubleshooting
 
-```text
-hidden[p] = WTE[token_id] + WPE[p]
-```
+License
 
-This produces the initial hidden state for every token in the sequence.
+Project Goals
 
-If the prompt contains `N` tokens, the initial tensor is approximately:
+This repository is primarily an implementation and learning project.
 
-```text
-N × 768
-```
+Modern ML libraries can make inference look like:
 
----
+logits = model(tokens)
 
-# 5. Transformer Blocks
+That line hides most of the interesting work.
 
-GPT-2 Small contains **12 Transformer blocks**.
+This project expands that hidden computation into explicit C++ code so that the reader can inspect:
 
-Each block processes the entire sequence and allows every token to incorporate information from previous positions.
+how model weights are stored in memory
 
-Each block contains two major sublayers:
+how token IDs become vectors
 
-```text
-1. Causal self-attention
-2. Feed-forward MLP
-```
+how attention generates Q/K/V
 
-with residual connections around them.
+how causal attention prevents looking into the future
 
-Conceptually:
+how the MLP transforms every token
 
-```text
-Input
+how 12 Transformer blocks are chained together
+
+how the final hidden state becomes 50,257 vocabulary logits
+
+how the engine turns those logits into a generated token
+
+how generation feeds that token back into the next forward pass
+
+The current implementation is intentionally optimized for clarity and directness, not production inference throughput.
+
+What Is an Inference Engine?
+
+A trained language model consists of an architecture plus learned parameters.
+
+Training looks roughly like:
+
+Training Data
+     │
+     ▼
+Tokenizer
+     │
+     ▼
+Token IDs
+     │
+     ▼
+Transformer
+     │
+     ▼
+Predictions
+     │
+     ▼
+Loss
+     │
+     ▼
+Backpropagation
+     │
+     ▼
+Updated Weights
+
+This project does not perform training.
+
+The weights already exist. The engine executes the forward computation using those weights:
+
+Prompt
   │
   ▼
-LayerNorm
+Tokenizer
   │
   ▼
-Self-Attention
+Token IDs
   │
   ▼
-Residual Add
+Token + Position Embeddings
   │
   ▼
-LayerNorm
+Transformer Block × 12
   │
   ▼
-MLP
+Final LayerNorm
   │
   ▼
-Residual Add
+Vocabulary Projection
   │
   ▼
-Output
-```
+50,257 Logits
+  │
+  ▼
+Argmax
+  │
+  ▼
+Next Token
+  │
+  └──────────────► Append token and repeat
 
-GPT-2 uses a **pre-normalization** structure, meaning LayerNorm is applied before each sublayer.
+That execution is inference.
 
----
+In this repository, the C++ program acts as a specialized inference runtime for GPT-2 Small.
 
-# 6. Layer Normalization
+Model Architecture
 
-LayerNorm normalizes the hidden representation of each token.
+The implementation targets GPT-2 Small / 124M.
 
-For a vector:
+Parameter
 
-```text
-x = [x₁, x₂, ..., x₇₆₈]
-```
+Value
 
-the implementation computes the mean:
+Vocabulary size
 
-```text
-μ = (1 / 768) Σ xᵢ
-```
+50,257
 
-and variance:
+Hidden size
 
-```text
-σ² = (1 / 768) Σ (xᵢ - μ)²
-```
-
-The normalized representation is:
-
-```text
-x̂ᵢ = (xᵢ - μ) / sqrt(σ² + ε)
-```
-
-GPT-2 then applies learned scale and bias parameters:
-
-```text
-outputᵢ = γᵢ x̂ᵢ + βᵢ
-```
-
-where:
-
-* `γ` is the learned scale
-* `β` is the learned bias
-* `ε` prevents division by zero
-
-This operation is performed independently for each token.
-
----
-
-# 7. Self-Attention
-
-Self-attention is the central mechanism that allows GPT-2 to determine which earlier tokens are relevant to the current token.
-
-The normalized hidden states are projected into:
-
-```text
-Q = Query
-K = Key
-V = Value
-```
-
-GPT-2 performs this using a single linear layer whose output contains all three projections.
-
-For hidden size 768:
-
-```text
-QKV = XW + b
-```
-
-where the output dimension is:
-
-```text
-768 × 3 = 2304
-```
-
-The resulting vector is split into:
-
-```text
-Q ∈ R^768
-K ∈ R^768
-V ∈ R^768
-```
-
-and then divided into 12 attention heads.
-
----
-
-# 8. Multi-Head Attention
-
-GPT-2 uses:
-
-```text
-12 attention heads
-```
-
-with:
-
-```text
-768 / 12 = 64
-```
-
-dimensions per head.
-
-Therefore:
-
-```text
-Head 0 → 64 dimensions
-Head 1 → 64 dimensions
-...
-Head 11 → 64 dimensions
-```
-
-Each attention head independently computes relationships between tokens.
-
-This allows different heads to learn different types of relationships.
-
----
-
-# 9. Attention Score Calculation
-
-For a particular head, attention compares each query against every available key.
-
-The raw attention score between token positions `i` and `j` is:
-
-```text
-score(i,j) = Qᵢ · Kⱼ
-```
-
-The dot product is then scaled by the square root of the head dimension:
-
-```text
-score(i,j) =
-    (Qᵢ · Kⱼ) / sqrt(64)
-```
-
-This scaling keeps the values in a range that makes the softmax numerically more stable.
-
----
-
-# 10. Causal Attention
-
-GPT-2 is an **autoregressive language model**.
-
-A token cannot use information from future tokens.
-
-For example:
-
-```text
-The quick brown fox
-```
-
-When processing:
-
-```text
-brown
-```
-
-the model can attend to:
-
-```text
-The
-quick
-brown
-```
-
-but not:
-
-```text
-fox
-```
-
-The implementation therefore applies a causal mask:
-
-```text
-          Key position
-
-          0   1   2   3
-Query 0   ✓   ✗   ✗   ✗
-Query 1   ✓   ✓   ✗   ✗
-Query 2   ✓   ✓   ✓   ✗
-Query 3   ✓   ✓   ✓   ✓
-```
-
-In implementation terms, attention is only computed where:
-
-```cpp
-j <= t
-```
-
-Future positions are excluded from the attention calculation.
-
-This is what makes the model suitable for next-token prediction.
-
----
-
-# 11. Softmax
-
-The masked attention scores are converted into normalized attention weights using softmax:
-
-```text
-softmax(xᵢ) = exp(xᵢ) / Σ exp(xⱼ)
-```
-
-The resulting values form a probability-like distribution across the tokens that the current position can attend to.
-
-For example:
-
-```text
-Token        Attention Weight
-
-The             0.10
-quick           0.20
-brown           0.70
-```
-
-The weights sum approximately to:
-
-```text
-1.0
-```
-
----
-
-# 12. Weighted Value Aggregation
-
-The attention weights are used to combine the value vectors:
-
-```text
-Attention(Q,K,V) = softmax(QKᵀ / sqrt(dₖ)) V
-```
-
-Conceptually:
-
-```text
-Value(The)   × 0.10
-Value(quick) × 0.20
-Value(brown) × 0.70
-               │
-               ▼
-        weighted sum
-               │
-               ▼
-        attention output
-```
-
-Every attention head produces its own output vector.
-
-The 12 heads are then concatenated:
-
-```text
-64 × 12 = 768
-```
-
-giving the hidden dimension back.
-
----
-
-# 13. Attention Output Projection
-
-The concatenated attention result is passed through another linear projection:
-
-```text
-output = attention_output Wₚ + bₚ
-```
-
-This allows information from all attention heads to be mixed back into the model's 768-dimensional hidden representation.
-
----
-
-# 14. Residual Connection
-
-GPT-2 uses residual connections around the attention layer.
-
-The attention output is added back to the original hidden state:
-
-```text
-x = x + Attention(x)
-```
-
-Residual connections help information flow through deep Transformer networks.
-
-The same structure is used around the MLP.
-
----
-
-# 15. Feed-Forward MLP
-
-After self-attention, each token independently passes through a feed-forward neural network.
-
-GPT-2 expands the hidden dimension:
-
-```text
-768 → 3072
-```
-
-using a linear layer:
-
-```text
-h = xW_fc + b_fc
-```
-
-Then GELU is applied.
-
----
-
-# 16. GELU Activation
-
-GPT-2 uses the Gaussian Error Linear Unit (GELU).
-
-The implementation uses the commonly used tanh approximation:
-
-```text
-GELU(x) ≈
-0.5x(1 + tanh(√(2/π)(x + 0.044715x³)))
-```
-
-This introduces non-linearity into the network.
-
-The representation is then projected back:
-
-```text
-3072 → 768
-```
-
-using another linear transformation.
-
-So the MLP effectively performs:
-
-```text
 768
- ↓
-3072
- ↓ GELU
-3072
- ↓
-768
-```
 
-followed by another residual connection:
+Transformer blocks
 
-```text
-x = x + MLP(x)
-```
+12
 
----
+Attention heads
 
-# 17. One Complete Transformer Block
+12
 
-Putting everything together:
+Head dimension
 
-```text
-                 Input
-                   │
-                   ▼
-              LayerNorm
-                   │
-                   ▼
-           QKV Projection
-                   │
-                   ▼
-        ┌────────────────────┐
-        │ 12 Attention Heads │
-        └────────────────────┘
-                   │
-                   ▼
-            Causal Mask
-                   │
-                   ▼
-                Softmax
-                   │
-                   ▼
-           Weighted Values
-                   │
-                   ▼
-          Output Projection
-                   │
-                   ▼
-             Residual Add
-                   │
-                   ▼
-              LayerNorm
-                   │
-                   ▼
-            Linear 768→3072
-                   │
-                   ▼
-                 GELU
-                   │
-                   ▼
-            Linear 3072→768
-                   │
-                   ▼
-             Residual Add
-                   │
-                   ▼
-                 Output
-```
+64
 
-GPT-2 executes this block **12 times sequentially**.
+MLP hidden size
 
----
+3,072
 
-# 18. Final Layer Normalization
+Maximum context
 
-After the twelfth Transformer block, the final hidden representation passes through GPT-2's final LayerNorm:
+1,024 tokens
 
-```text
-hidden → final LayerNorm
-```
+Activation
 
-The result is the representation used for next-token prediction.
+GELU
 
----
+Attention
 
-# 19. Vocabulary Projection
+Causal self-attention
 
-The model now needs to convert the final hidden state into scores for every vocabulary token.
+The architecture is:
 
-GPT-2 has:
+flowchart TD
+    A["Text Prompt"] --> B["GPT-2 Tokenizer"]
+    B --> C["Token IDs"]
+    C --> D["Token Embedding WTE"]
+    D --> E["Add Position Embedding WPE"]
+    E --> F["Transformer Block 0"]
+    F --> G["Transformer Block 1"]
+    G --> H["..."]
+    H --> I["Transformer Block 11"]
+    I --> J["Final LayerNorm"]
+    J --> K["Vocabulary Projection using WTEᵀ"]
+    K --> L["50,257 Logits"]
+    L --> M["Argmax"]
+    M --> N["Next Token"]
+    N --> O["Append to Context"]
+    O --> F
 
-```text
-50,257 vocabulary tokens
-```
-
-The final hidden vector has:
-
-```text
-768 dimensions
-```
-
-Therefore the output must contain:
-
-```text
-50,257 scores
-```
-
-The projection is approximately:
-
-```text
-logits = hidden × WTEᵀ
-```
-
-This implementation uses the **token embedding matrix itself** for this projection, meaning the input token embeddings and output vocabulary projection are tied.
-
-The output is therefore:
-
-```text
-logits[0]
-logits[1]
-logits[2]
-...
-logits[50256]
-```
-
-Each value represents the model's unnormalized score for one vocabulary token.
-
----
-
-# 20. Logits Are Not Yet Probabilities
-
-The values produced by the vocabulary projection are called **logits**.
-
-For example:
-
-```text
-Token        Logit
-
-the            4.21
-fox            8.94
-cat             7.12
-dog             6.31
-...
-```
-
-A larger logit means the model assigns a higher relative preference to that token.
-
-A probability distribution could be obtained using softmax:
-
-```text
-P(tokenᵢ) = exp(logitᵢ) / Σ exp(logitⱼ)
-```
-
-However, this implementation does not currently perform sampling.
-
----
-
-# 21. Greedy Decoding
-
-The engine uses **greedy decoding**.
-
-It simply selects the token with the largest logit:
-
-```text
-next_token = argmax(logits)
-```
-
-For example:
-
-```text
-fox → 8.94
-cat → 7.12
-dog → 6.31
-```
-
-Therefore:
-
-```text
-next token = fox
-```
-
-The selected token is appended to the current sequence.
-
----
-
-# 22. Autoregressive Generation
-
-Generation then repeats the entire process.
+End-to-End Data Flow
 
 Suppose the user enters:
 
-```text
 The quick brown
-```
 
-The engine performs:
+The engine performs the following pipeline:
 
-```text
-The quick brown
-        ↓
-      model
-        ↓
-       fox
-```
+"The quick brown"
+       │
+       ▼
+GPT-2 tokenizer
+       │
+       ▼
+[ token_0, token_1, token_2, ... ]
+       │
+       ▼
+Embedding lookup
+       │
+       +
+Position embedding
+       │
+       ▼
+768-dimensional representation
+       │
+       ▼
+Transformer block 0
+       │
+       ▼
+Transformer block 1
+       │
+       ▼
+...
+       │
+       ▼
+Transformer block 11
+       │
+       ▼
+Final LayerNorm
+       │
+       ▼
+768-dimensional final representation
+       │
+       ▼
+Dot product with every vocabulary embedding
+       │
+       ▼
+50,257 logits
+       │
+       ▼
+argmax
+       │
+       ▼
+next token
 
-The new sequence becomes:
+If the selected token is fox, the sequence becomes:
 
-```text
 The quick brown fox
-```
 
-The engine runs inference again:
+The engine then runs another forward pass using that larger sequence.
 
-```text
-The quick brown fox
-        ↓
-      model
-        ↓
-      jumps
-```
+Repository Layout
 
-Then:
+A typical project layout is:
 
-```text
-The quick brown fox jumps
-        ↓
-      model
-        ↓
-       over
-```
-
-This continues until the requested number of new tokens is produced.
-
----
-
-# 23. Important Implementation Detail: No KV Cache
-
-The current implementation intentionally performs a full forward pass for every generated token.
-
-Suppose the original prompt contains:
-
-```text
-N tokens
-```
-
-and the engine generates:
-
-```text
-1 token
-```
-
-The model processes all `N` positions.
-
-After another token is generated:
-
-```text
-N + 1 tokens
-```
-
-the engine processes the entire sequence again.
-
-After another token:
-
-```text
-N + 2 tokens
-```
-
-and so on.
-
-Conceptually:
-
-```text
-Step 1 → process N tokens
-Step 2 → process N+1 tokens
-Step 3 → process N+2 tokens
-Step 4 → process N+3 tokens
-...
-```
-
-Production-grade Transformer inference commonly uses a **KV cache** to avoid recomputing previous keys and values.
-
-This project does not currently implement that optimization.
-
-As a result, generation becomes increasingly expensive as the context grows.
-
----
-
-# 24. Weight Loading
-
-The model architecture itself does not contain learned knowledge.
-
-The knowledge is encoded in the weights.
-
-This engine loads GPT-2's trained parameters from plain-text tensor files.
-
-For example:
-
-```text
-transformer.wte.weight.txt
-transformer.wpe.weight.txt
-transformer.h.0.ln_1.weight.txt
-transformer.h.0.attn.c_attn.weight.txt
-...
-```
-
-Each file contains whitespace-separated floating-point values.
-
-For example:
-
-```text
-0.0123
--0.0841
-0.0021
-...
-```
-
-The engine reads these values into C++ memory.
-
----
-
-# 25. Matrix Multiplication
-
-A large part of Transformer inference consists of matrix multiplication.
-
-For a linear layer:
-
-```text
-y = xW + b
-```
-
-the implementation explicitly computes each output value.
-
-Conceptually:
-
-```cpp
-for (int i = 0; i < inputSize; ++i) {
-    for (int j = 0; j < outputSize; ++j) {
-        output[j] += input[i] * weight[i * outputSize + j];
-    }
-}
-```
-
-This is intentionally straightforward.
-
-It makes the mathematical operation easy to inspect, but it is also one of the primary performance bottlenecks of the implementation.
-
-Production inference engines normally use optimized kernels, SIMD instructions, BLAS libraries, GPU kernels, multithreading, or specialized hardware.
-
----
-
-# 26. Weight Memory Layout
-
-The `.txt` tensors use a flat row-major representation.
-
-For a weight matrix with:
-
-```text
-inputSize × outputSize
-```
-
-the engine indexes:
-
-```cpp
-weight[i * outputSize + j]
-```
-
-which corresponds to:
-
-```text
-W[i][j]
-```
-
-This layout is important because incorrect tensor ordering would produce completely incorrect model outputs even when the mathematical operations themselves are implemented correctly.
-
----
-
-# 27. Tokenization Architecture
-
-Tokenization is kept separate from the C++ inference implementation.
-
-The engine invokes Python using:
-
-```text
-python3
-```
-
-and communicates with the tokenizer through temporary files.
-
-The Python process uses Hugging Face's:
-
-```text
-tokenizers
-```
-
-package and the GPT-2 tokenizer configuration located at:
-
-```text
-weights/tokenizer/tokenizer.json
-```
-
-The environment variable:
-
-```bash
-GPT2_PYTHON
-```
-
-can be used to select another Python interpreter.
-
-Example:
-
-```bash
-GPT2_PYTHON=python3.11 ./gpt2_infer
-```
-
-This separation keeps the neural-network implementation in C++ while using the reference tokenizer for text ↔ token conversion.
-
----
-
-# 28. Interactive REPL
-
-The executable provides a small interactive interface:
-
-```text
-Prompt: The quick brown fox
-Number of new tokens: 10
-```
-
-The engine then:
-
-1. Tokenizes the prompt.
-2. Displays the prompt token IDs.
-3. Displays the corresponding GPT-2 token pieces.
-4. Runs the Transformer.
-5. Finds the highest-scoring next token.
-6. Prints the generated token.
-7. Adds the token to the sequence.
-8. Repeats until the requested number of tokens is generated.
-9. Decodes the final token sequence back into text.
-
-Example:
-
-```text
-Prompt: The quick brown
-
-Number of new tokens: 5
-
-Token: The
-ID: 464
-
-Token: quick
-ID: 2068
-
-Token: brown
-ID: 7586
-
-Generated:
-fox jumps over the lazy
-```
-
-The exact output depends on the weights and tokenizer files being used.
-
----
-
-# 29. Directory Structure
-
-```text
 project-root/
 │
 ├── src/
@@ -1208,518 +346,2093 @@ project-root/
 │   ├── transformer.ln_f.weight.txt
 │   ├── transformer.ln_f.bias.txt
 │   │
-│   ├── transformer.h.0/
-│   │   └── ...
+│   ├── transformer.h.0.ln_1.weight.txt
+│   ├── transformer.h.0.ln_1.bias.txt
+│   ├── transformer.h.0.attn.c_attn.weight.txt
+│   ├── transformer.h.0.attn.c_attn.bias.txt
+│   ├── transformer.h.0.attn.c_proj.weight.txt
+│   ├── transformer.h.0.attn.c_proj.bias.txt
+│   ├── transformer.h.0.ln_2.weight.txt
+│   ├── transformer.h.0.ln_2.bias.txt
+│   ├── transformer.h.0.mlp.c_fc.weight.txt
+│   ├── transformer.h.0.mlp.c_fc.bias.txt
+│   ├── transformer.h.0.mlp.c_proj.weight.txt
+│   ├── transformer.h.0.mlp.c_proj.bias.txt
 │   │
-│   ├── transformer.h.1/
-│   │   └── ...
-│   │
-│   ├── ...
-│   │
-│   ├── transformer.h.11/
-│   │   └── ...
+│   ├── ... same structure for layers 1–11
 │   │
 │   └── tokenizer/
 │       └── tokenizer.json
 │
 └── build/
     └── gpt2_infer
-```
 
-The exact weight filenames follow the flattened naming convention expected by the implementation.
+The current source expects the weights directory to be available as:
 
----
-
-# 30. Requirements
-
-## Compiler
-
-A C++17-compatible compiler.
-
-For example:
-
-```bash
-g++
-```
-
-## C++ dependency
-
-[nlohmann/json](https://github.com/nlohmann/json)
-
-The single-header version is expected at:
-
-```text
-include/json.hpp
-```
-
-## Python
-
-Python 3 with Hugging Face `tokenizers`:
-
-```bash
-pip install tokenizers
-```
-
-## Model Weights
-
-GPT-2 Small / 124M weights exported into the plain-text tensor layout expected by the engine.
-
----
-
-# 31. Building
-
-From the project root:
-
-```bash
-g++ -std=c++17 -O3 -I include -o gpt2_infer src/main.cpp
-```
-
-The `-O3` optimization level is recommended because inference performs a large number of floating-point operations.
-
----
-
-# 32. Running
-
-The executable expects the weights directory to resolve as:
-
-```text
 ../weights
-```
 
-from the directory containing the executable.
+relative to the process working directory.
+
+Codebase at a Glance
+
+The entire model is currently implemented in a single C++ translation unit.
+
+The important functions and types are:
+
+Tensor
+  │
+  └── std::vector<float>
+
+loadTensor()
+  │
+  └── Reads one weight tensor from disk
+
+Block
+  │
+  └── Stores one Transformer block's parameters
+
+GPT2
+  │
+  ├── Stores WTE / WPE
+  ├── Stores 12 Blocks
+  └── Loads all model weights
+
+layerNorm()
+linear()
+gelu()
+applyGelu()
+softmax()
+  │
+  └── Core numerical primitives
+
+attention()
+  │
+  └── QKV + causal multi-head attention
+
+mlp()
+  │
+  └── 768 → 3072 → 768
+
+transformerBlock()
+  │
+  └── LayerNorm → Attention → Residual
+      LayerNorm → MLP → Residual
+
+forward()
+  │
+  └── Embeddings → 12 Blocks → Final Norm → Logits
+
+argmax()
+  │
+  └── Select next token
+
+Tokenizer
+  │
+  ├── Loads vocabulary for display
+  ├── Exact encode through Python
+  └── Exact decode through Python
+
+main()
+  │
+  └── REPL + autoregressive generation
+
+Code Walkthrough
+
+1. Model Constants and Tensor Representation
+
+At the beginning of main.cpp, the architecture is expressed directly as compile-time constants:
+
+constexpr int VOCAB_SIZE = 50257;
+constexpr int HIDDEN_SIZE = 768;
+constexpr int NUM_LAYERS = 12;
+constexpr int NUM_HEADS = 12;
+constexpr int HEAD_DIM = 64;
+constexpr int MLP_SIZE = 3072;
+constexpr int MAX_CONTEXT = 1024;
+constexpr float EPSILON = 1e-5f;
+
+These constants define the GPT-2 Small configuration used by the entire program.
+
+The important relationships are:
+
+768 / 12 = 64
+
+so every attention head operates on 64 dimensions.
+
+The project defines:
+
+using Tensor = std::vector<float>;
+
+This is an intentionally simple tensor representation.
+
+There is no custom tensor class.
+
+A Tensor is just a contiguous array of floats.
+
+For sequence-level data, the implementation uses:
+
+std::vector<std::vector<float>>
+
+so a sequence can be represented conceptually as:
+
+[
+    token_0 hidden vector,
+    token_1 hidden vector,
+    token_2 hidden vector,
+    ...
+]
+
+2. Loading Tensor Weights
+
+The fundamental weight-loading function is:
+
+Tensor loadTensor(const std::string& path, size_t expected)
+
+Its responsibility is simple:
+
+file on disk
+    ↓
+read float
+    ↓
+append to vector
+    ↓
+validate element count
+    ↓
+return Tensor
+
+The function opens a text file:
+
+std::ifstream file(path);
+
+and repeatedly extracts floats:
+
+while (file >> value)
+    data.push_back(value);
+
+The important safety check is the expected tensor size.
+
+After loading, the code verifies:
+
+if (data.size() != expected)
+    throw std::runtime_error(...);
+
+This catches malformed or incompatible weight files early.
+
+For example, if a matrix should contain:
+
+768 × 768 = 589,824
+
+values but the file contains fewer or more values, the program stops instead of silently executing with a corrupted tensor.
+
+Why this matters
+
+The Transformer is extremely sensitive to tensor shape.
+
+A wrong number of values is not a minor formatting issue—it means the model parameters no longer correspond to the computation graph.
+
+3. Representing a Transformer Block
+
+The Block structure stores the parameters required by one GPT-2 Transformer block:
+
+struct Block
+{
+    Tensor ln1Weight;
+    Tensor ln1Bias;
+
+    Tensor cAttnWeight;
+    Tensor cAttnBias;
+
+    Tensor cProjWeight;
+    Tensor cProjBias;
+
+    Tensor ln2Weight;
+    Tensor ln2Bias;
+
+    Tensor cFcWeight;
+    Tensor cFcBias;
+
+    Tensor cProjMlpWeight;
+    Tensor cProjMlpBias;
+};
+
+This directly mirrors GPT-2's block structure.
+
+The names correspond to the components:
+
+Field
+
+Role
+
+ln1Weight / ln1Bias
+
+LayerNorm before attention
+
+cAttnWeight / cAttnBias
+
+Combined QKV projection
+
+cProjWeight / cProjBias
+
+Attention output projection
+
+ln2Weight / ln2Bias
+
+LayerNorm before MLP
+
+cFcWeight / cFcBias
+
+MLP expansion 768 → 3072
+
+cProjMlpWeight / cProjMlpBias
+
+MLP contraction 3072 → 768
+
+Instead of representing these as separate high-level neural-network objects, the implementation stores the raw parameter arrays.
+
+4. Representing and Loading GPT-2
+
+The GPT2 structure stores the global model weights:
+
+struct GPT2
+{
+    Tensor wte;
+    Tensor wpe;
+
+    std::array<Block, NUM_LAYERS> blocks;
+
+    Tensor lnFinalWeight;
+    Tensor lnFinalBias;
+};
+
+These are:
+
+wte: token embeddings
+
+wpe: positional embeddings
+
+blocks: all 12 Transformer blocks
+
+lnFinalWeight / lnFinalBias: final LayerNorm
+
+The load() method loads every tensor from disk.
+
+The token embedding matrix has:
+
+50,257 × 768
+
+values.
+
+The position embedding matrix has:
+
+1,024 × 768
+
+values.
+
+For every Transformer block, load() constructs the layer prefix:
+
+std::string p =
+    dir +
+    "/transformer.h." +
+    std::to_string(layer) +
+    ".";
+
+Then it loads each parameter file with its expected element count.
+
+This gives the model object a complete in-memory copy of GPT-2's learned parameters.
+
+5. LayerNorm
+
+The implementation of LayerNorm is:
+
+std::vector<float> layerNorm(
+    const std::vector<float>& x,
+    const Tensor& weight,
+    const Tensor& bias
+)
+
+For one hidden vector, it first computes the mean:
+
+float mean = 0.0f;
+
+for (float v : x)
+    mean += v;
+
+mean /= static_cast<float>(x.size());
+
+Then the variance:
+
+float variance = 0.0f;
+
+for (float v : x)
+{
+    float d = v - mean;
+    variance += d * d;
+}
+
+variance /= static_cast<float>(x.size());
+
+The inverse standard deviation is:
+
+float invStd =
+    1.0f / std::sqrt(variance + EPSILON);
+
+Finally, every element is normalized and transformed using learned scale and bias:
+
+output[i] =
+    ((x[i] - mean) * invStd) * weight[i] +
+    bias[i];
+
+Mathematically:
+
+μ  = mean(x)
+
+σ² = mean((x - μ)²)
+
+x̂ = (x - μ) / sqrt(σ² + ε)
+
+y  = γx̂ + β
+
+The same layerNorm() primitive is used for:
+
+attention pre-normalization
+
+MLP pre-normalization
+
+final model normalization
+
+6. Linear Layers
+
+Nearly every major learned transformation in GPT-2 can be expressed as:
+
+y = xW + b
+
+The implementation centralizes this operation in:
+
+std::vector<float> linear(
+    const std::vector<float>& input,
+    const Tensor& weight,
+    const Tensor& bias,
+    int inputSize,
+    int outputSize
+)
+
+The output vector is initialized with the requested number of dimensions.
+
+For each output neuron:
+
+for (int j = 0; j < outputSize; ++j)
+{
+    float sum = bias[j];
+
+    for (int i = 0; i < inputSize; ++i)
+    {
+        sum +=
+            input[i] *
+            weight[
+                static_cast<size_t>(i) *
+                outputSize +
+                j
+            ];
+    }
+
+    output[j] = sum;
+}
+
+This is a direct implementation of a fully connected layer.
+
+For one output index j:
+
+output[j] =
+    bias[j]
+    + input[0] * W[0,j]
+    + input[1] * W[1,j]
+    + ...
+    + input[inputSize-1] * W[inputSize-1,j]
+
+Weight layout
+
+The weight matrix is stored as a flat array.
+
+The code accesses:
+
+weight[i * outputSize + j]
+
+which represents:
+
+W[i][j]
+
+This is important because the file layout and the code's indexing convention must agree exactly.
+
+Where linear() is used
+
+The same primitive handles:
+
+Attention:
+768 → 2304
+768 → 768
+
+MLP:
+768 → 3072
+3072 → 768
+
+Instead of implementing four different matrix-multiplication routines, the program has one reusable linear operator.
+
+7. GELU
+
+The MLP uses GELU.
+
+The scalar implementation is:
+
+float gelu(float x)
+
+using the tanh approximation:
+
+GELU(x) ≈
+0.5x [1 + tanh( √(2/π) (x + 0.044715x³) )]
+
+The code defines:
+
+constexpr float c = 0.7978845608028654f;
+
+which is approximately:
+
+sqrt(2 / π)
+
+Then:
+
+return 0.5f *
+       x *
+       (
+           1.0f +
+           std::tanh(
+               c *
+               (
+                   x +
+                   0.044715f *
+                   x * x * x
+               )
+           )
+       );
+
+Because the MLP operates on a vector, the project also defines:
+
+std::vector<float> applyGelu(
+    const std::vector<float>& x
+)
+
+which simply applies gelu() element-by-element.
+
+8. Softmax
+
+Softmax converts a vector of scores into normalized weights.
+
+The implementation:
+
+std::vector<float> softmax(
+    const std::vector<float>& x
+)
+
+first handles an empty vector.
+
+Then it finds the maximum value:
+
+float maxValue =
+    *std::max_element(
+        x.begin(),
+        x.end()
+    );
+
+The exponentials use the stabilized form:
+
+std::exp(x[i] - maxValue);
+
+and then the values are divided by their sum.
+
+Mathematically:
+
+softmax(xᵢ) = exp(xᵢ) / Σ exp(xⱼ)
+
+but numerically the implementation uses:
+
+exp(xᵢ - max(x))
+
+which helps prevent unnecessarily large exponentials.
+
+The result is a vector whose values approximately sum to:
+
+1.0
+
+In this project, softmax is used inside attention.
+
+9. Multi-Head Causal Self-Attention
+
+The attention implementation lives in:
+
+std::vector<std::vector<float>> attention(
+    const std::vector<std::vector<float>>& input,
+    const Block& block
+)
+
+This function receives the sequence after the first LayerNorm and computes the complete attention output for every position.
+
+9.1 Sequence length
+
+The function begins by determining:
+
+const int seqLen =
+    static_cast<int>(input.size());
+
+If the prompt contains N tokens, then:
+
+seqLen = N
+
+9.2 Q, K and V storage
+
+The implementation creates three sequence-sized tensors:
+
+q
+k
+v
+
+each with:
+
+seqLen × 768
+
+dimensions.
+
+So:
+
+Q = [q₀, q₁, ..., qₙ₋₁]
+K = [k₀, k₁, ..., kₙ₋₁]
+V = [v₀, v₁, ..., vₙ₋₁]
+
+9.3 Combined QKV projection
+
+For each token position:
+
+std::vector<float> qkv =
+    linear(
+        input[t],
+        block.cAttnWeight,
+        block.cAttnBias,
+        HIDDEN_SIZE,
+        HIDDEN_SIZE * 3
+    );
+
+The output size is:
+
+768 × 3 = 2304
+
+The 2304 values are then split into:
+
+0      ... 767   → Q
+768    ... 1535  → K
+1536   ... 2303  → V
+
+The code performs exactly that split:
+
+q[t][i] = qkv[i];
+
+k[t][i] = qkv[HIDDEN_SIZE + i];
+
+v[t][i] = qkv[2 * HIDDEN_SIZE + i];
+
+So the single GPT-2 c_attn projection simultaneously generates Query, Key, and Value.
+
+9.4 Attention heads
+
+GPT-2 uses:
+
+12 heads
+
+with:
+
+64 dimensions per head
+
+The implementation computes:
+
+const int offset =
+    head * HEAD_DIM;
+
+so:
+
+head 0 → dimensions 0..63
+head 1 → dimensions 64..127
+...
+head 11 → dimensions 704..767
+
+No explicit tensor transpose is created. Head slices are accessed directly from the flattened hidden vectors.
+
+9.5 Scaled dot-product attention
+
+For a query at position t and a key at position j, the implementation computes:
+
+for (int d = 0; d < HEAD_DIM; ++d)
+{
+    score +=
+        q[t][offset + d] *
+        k[j][offset + d];
+}
+
+This is:
+
+Qₜ · Kⱼ
+
+The score is then scaled using:
+
+const float scale =
+    1.0f / std::sqrt(
+        static_cast<float>(HEAD_DIM)
+    );
+
+so mathematically:
+
+score(t,j) =
+    (Qₜ · Kⱼ) / sqrt(64)
+
+9.6 Causal masking
+
+This implementation does something simple and important.
+
+Instead of computing scores for every j and then explicitly writing -∞ into future positions, it only allocates:
+
+std::vector<float> scores(t + 1);
+
+and only loops over:
+
+for (int j = 0; j <= t; ++j)
+
+That means position t is allowed to attend only to:
+
+0, 1, 2, ..., t
+
+and never to:
+
+t + 1, t + 2, ...
+
+The causal constraint is therefore enforced by the loop bounds themselves.
+
+The attention matrix is conceptually:
+
+        Key
+        0  1  2  3
+Query
+  0     ✓  ✗  ✗  ✗
+  1     ✓  ✓  ✗  ✗
+  2     ✓  ✓  ✓  ✗
+  3     ✓  ✓  ✓  ✓
+
+This is what makes the Transformer autoregressive.
+
+9.7 Softmax over attention scores
+
+After computing the visible scores:
+
+std::vector<float> probabilities =
+    softmax(scores);
+
+the engine obtains attention weights for that position.
+
+For a token at position t, the probabilities only cover positions:
+
+0 ... t
+
+9.8 Weighted sum of values
+
+The implementation then computes:
+
+context[t][offset + d] +=
+    probabilities[j] *
+    v[j][offset + d];
+
+This is:
+
+head_output(t)
+    =
+Σⱼ attention_weight(t,j) × Vⱼ
+
+Each head produces a 64-dimensional result.
+
+Across 12 heads:
+
+12 × 64 = 768
+
+so the result returns to the model's hidden dimension.
+
+9.9 Attention output projection
+
+After all heads have been written into context, the code applies another linear layer:
+
+output[t] =
+    linear(
+        context[t],
+        block.cProjWeight,
+        block.cProjBias,
+        HIDDEN_SIZE,
+        HIDDEN_SIZE
+    );
+
+This mixes information across the 12 heads and produces the final attention sublayer output.
+
+10. The MLP
+
+The feed-forward network is implemented in:
+
+std::vector<float> mlp(
+    const std::vector<float>& input,
+    const Block& block
+)
+
+The MLP performs:
+
+768
+ ↓
+3072
+ ↓ GELU
+3072
+ ↓
+768
+
+The first projection is:
+
+hidden =
+    linear(
+        input,
+        block.cFcWeight,
+        block.cFcBias,
+        HIDDEN_SIZE,
+        MLP_SIZE
+    );
+
+giving:
+
+768 → 3072
+
+Then:
+
+hidden = applyGelu(hidden);
+
+Finally:
+
+return linear(
+    hidden,
+    block.cProjMlpWeight,
+    block.cProjMlpBias,
+    MLP_SIZE,
+    HIDDEN_SIZE
+);
+
+gives:
+
+3072 → 768
+
+The important architectural point is that attention mixes information between token positions, while the MLP processes each token's hidden vector independently.
+
+11. One Transformer Block
+
+The transformerBlock() function combines LayerNorm, attention, residual connections, and MLP.
+
+Its flow is:
+
+Input
+  │
+  ▼
+LayerNorm 1
+  │
+  ▼
+Self-Attention
+  │
+  ▼
+Residual Add
+  │
+  ▼
+LayerNorm 2
+  │
+  ▼
+MLP
+  │
+  ▼
+Residual Add
+  │
+  ▼
+Output
+
+The first normalization is:
+
+ln1[t] =
+    layerNorm(
+        input[t],
+        block.ln1Weight,
+        block.ln1Bias
+    );
+
+Then attention:
+
+std::vector<std::vector<float>> attn =
+    attention(
+        ln1,
+        block
+    );
+
+The first residual connection is:
+
+x[t][i] += attn[t][i];
+
+Then a second LayerNorm is applied:
+
+ln2[t] =
+    layerNorm(
+        x[t],
+        block.ln2Weight,
+        block.ln2Bias
+    );
+
+The MLP output is generated:
+
+std::vector<float> m =
+    mlp(
+        ln2[t],
+        block
+    );
+
+and added back through the second residual connection:
+
+x[t][i] += m[i];
+
+The result is returned as the output of that Transformer block.
+
+12. The Full Forward Pass
+
+The main neural-network execution lives in:
+
+std::vector<float> forward(
+    const std::vector<int>& tokenIds,
+    const GPT2& model
+)
+
+This is the most important function in the engine.
+
+It performs the complete GPT-2 forward pass for a token sequence.
+
+12.1 Input validation
+
+The engine rejects an empty token sequence:
+
+if (tokenIds.empty())
+    throw std::runtime_error("No input tokens");
+
+It also enforces the GPT-2 context size:
+
+if (tokenIds.size() > MAX_CONTEXT)
+    throw std::runtime_error(
+        "Input exceeds GPT-2 context length"
+    );
+
+12.2 Build initial hidden states
+
+For every token position, the code computes:
+
+hidden[position][i] =
+    model.wte[tokenOffset + i] +
+    model.wpe[posOffset + i];
+
+This is:
+
+hidden[p] =
+    token_embedding[token_id]
+    +
+    position_embedding[p]
+
+Every token therefore starts with a 768-dimensional representation.
+
+For N tokens:
+
+hidden shape = N × 768
+
+12.3 Run all 12 Transformer blocks
+
+The core loop is:
+
+for (int layer = 0;
+     layer < NUM_LAYERS;
+     ++layer)
+{
+    hidden =
+        transformerBlock(
+            hidden,
+            model.blocks[layer]
+        );
+}
+
+This is the point where the initial embeddings are repeatedly transformed by GPT-2's learned layers.
+
+The shape remains:
+
+N × 768
+
+throughout the Transformer stack.
+
+Only the contents of the vectors change.
+
+13. Vocabulary Projection
+
+After the 12 Transformer blocks, the engine only needs the representation of the last position to predict the next token.
+
+The code extracts:
+
+std::vector<float> finalHidden =
+    layerNorm(
+        hidden.back(),
+        model.lnFinalWeight,
+        model.lnFinalBias
+    );
+
+hidden.back() means:
+
+the hidden vector at the last token position
+
+It then creates:
+
+std::vector<float> logits(
+    VOCAB_SIZE
+);
+
+so there is one output score for every GPT-2 vocabulary entry.
+
+13.1 Tied output projection
+
+For every possible vocabulary token:
+
+for (int token = 0;
+     token < VOCAB_SIZE;
+     ++token)
+
+the engine retrieves that token's embedding row:
+
+const size_t offset =
+    static_cast<size_t>(token) *
+    HIDDEN_SIZE;
+
+and computes its dot product with the final hidden state:
+
+for (int i = 0; i < HIDDEN_SIZE; ++i)
+{
+    sum +=
+        finalHidden[i] *
+        model.wte[offset + i];
+}
+
+So the output operation is:
+
+logit(token)
+    =
+finalHidden · WTE[token]
+
+or in matrix notation:
+
+logits = finalHidden × WTEᵀ
+
+This is weight tying: the same token embedding matrix used at the input is also used as the output vocabulary projection.
+
+No separate output projection tensor is loaded here.
+
+14. Greedy Decoding
+
+The forward() function returns raw logits.
+
+The next-token decision is handled separately by:
+
+int argmax(
+    const std::vector<float>& logits
+)
+
+The implementation uses:
+
+std::max_element(
+    logits.begin(),
+    logits.end()
+)
+
+and converts the iterator position into the vocabulary index.
+
+Conceptually:
+
+logits:
+
+token A → 3.12
+token B → 7.91
+token C → 2.84
+token D → 6.44
+
+argmax → token B
+
+This is greedy decoding.
+
+There is no:
+
+temperature
+
+top-k
+
+top-p
+
+sampling
+
+repetition penalty
+
+in the current implementation.
+
+15. Tokenizer Integration
+
+The project uses two tokenizer paths.
+
+C++ vocabulary loading
+
+The Tokenizer structure contains:
+
+std::vector<std::string> vocabulary;
+
+Its load() method reads:
+
+weights/tokenizer/tokenizer.json
+
+using nlohmann::json.
+
+The method navigates into:
+
+model → vocab
+
+and fills:
+
+vocabulary[token_id] = token_piece
+
+This gives the program a fast local mapping for printing token IDs and GPT-2 token pieces.
+
+Exact encoding
+
+The actual prompt encoding is handled by:
+
+std::vector<int> encodeExact(
+    const std::string& text
+)
+
+The C++ program writes the input prompt to:
+
+/tmp/gpt2_encode_input.txt
+
+then invokes Python:
+
+python3 -c "from tokenizers import Tokenizer; ..."
+
+using the GPT-2 tokenizer JSON.
+
+The environment variable:
+
+GPT2_PYTHON
+
+can replace the default Python executable.
 
 For example:
 
-```text
+GPT2_PYTHON=python3.11 ./gpt2_infer
+
+The Python process prints the token IDs as whitespace-separated integers, which the C++ program reads back into:
+
+std::vector<int>
+
+The temporary files are then removed.
+
+Exact decoding
+
+The reverse path is:
+
+std::string decodeExact(
+    const std::vector<int>& ids
+)
+
+The token IDs are serialized as JSON and passed to the same Hugging Face tokenizer through Python.
+
+The decoded text is read from the temporary output file and returned to the C++ program.
+
+Therefore the model computation remains native C++, while tokenization and decoding use the reference tokenizer implementation.
+
+16. Token Display
+
+The helper:
+
+void printToken(
+    int index,
+    int id,
+    const Tokenizer& tokenizer
+)
+
+prints three useful pieces of information:
+
+index
+token ID
+GPT-2 token piece
+
+plus a friendlier text representation.
+
+For example, the REPL can show:
+
+[0] ID: 464    GPT-2: "The"    Text: "The"
+
+The textToken() helper contains a small amount of display-only handling for GPT-2's token representation, including:
+
+byte-level space rendering
+
+the GPT-2 newline token
+
+This is separate from the actual Python tokenizer encode/decode path.
+
+17. Interactive Generation Loop
+
+main() wires everything together.
+
+At startup:
+
+GPT2 model;
+model.load("../weights");
+
+loads all model parameters.
+
+Then:
+
+Tokenizer tokenizer;
+tokenizer.load(
+    "../weights/tokenizer/tokenizer.json"
+);
+
+loads the tokenizer vocabulary.
+
+The program then enters a loop:
+
+while (true)
+
+and asks:
+
+Prompt:
+Number of new tokens:
+
+Prompt encoding
+
+The prompt is encoded:
+
+std::vector<int> inputIds =
+    encodeExact(prompt);
+
+Then the token IDs are printed using printToken().
+
+Context reservation
+
+If the prompt is already close to the maximum context length:
+
+if (inputIds.size() >= MAX_CONTEXT)
+{
+    inputIds.resize(
+        MAX_CONTEXT - 1
+    );
+}
+
+The subtraction by one is deliberate: it reserves room for at least one generated token.
+
+The maximum number of generated tokens is then limited with:
+
+const int allowed =
+    std::min(
+        maxNewTokens,
+        MAX_CONTEXT -
+        static_cast<int>(
+            inputIds.size()
+        )
+    );
+
+This guarantees that:
+
+prompt tokens + generated tokens <= 1024
+
+for a single generation session.
+
+Autoregressive loop
+
+The actual generation loop is:
+
+for (int step = 0;
+     step < allowed;
+     ++step)
+{
+    const std::vector<float> logits =
+        forward(
+            allTokens,
+            model
+        );
+
+    const int nextToken =
+        argmax(
+            logits
+        );
+
+    generated.push_back(
+        nextToken
+    );
+
+    allTokens.push_back(
+        nextToken
+    );
+
+    printToken(
+        step,
+        nextToken,
+        tokenizer
+    );
+}
+
+The key operation is:
+
+forward(allTokens, model)
+
+followed by:
+
+argmax(logits)
+
+and then:
+
+allTokens.push_back(nextToken)
+
+This creates the autoregressive feedback loop:
+
+Current context
+      │
+      ▼
+    forward()
+      │
+      ▼
+    logits
+      │
+      ▼
+    argmax()
+      │
+      ▼
+  next token
+      │
+      ▼
+append to context
+      │
+      └──────────► forward() again
+
+Finally, all tokens are decoded:
+
+decodeExact(allTokens)
+
+and the complete generated text is printed.
+
+Tensor Shapes
+
+Understanding the shapes is one of the easiest ways to understand the code.
+
+Let:
+
+N = current sequence length
+H = 768
+A = 12
+D = 64
+F = 3072
+V = 50257
+
+Then:
+
+Object
+
+Shape
+
+Token embedding WTE
+
+V × H
+
+Position embedding WPE
+
+1024 × H
+
+Hidden states
+
+N × H
+
+Q
+
+N × H
+
+K
+
+N × H
+
+V
+
+N × H
+
+Combined QKV projection
+
+H × 3H
+
+Per-head Q/K/V slice
+
+N × D
+
+Attention scores for one position/head
+
+t + 1
+
+Context
+
+N × H
+
+MLP expansion
+
+N × F
+
+MLP output
+
+N × H
+
+Final hidden state
+
+H
+
+Logits
+
+V
+
+For example, if:
+
+N = 5
+
+then the hidden state tensor is:
+
+5 × 768
+
+and the vocabulary output is:
+
+50,257
+
+floating-point scores.
+
+Weight File Mapping
+
+The source expects these tensors.
+
+File
+
+Purpose
+
+Expected elements
+
+transformer.wte.weight.txt
+
+Token embeddings
+
+50257 × 768
+
+transformer.wpe.weight.txt
+
+Position embeddings
+
+1024 × 768
+
+transformer.ln_f.weight.txt
+
+Final LayerNorm scale
+
+768
+
+transformer.ln_f.bias.txt
+
+Final LayerNorm bias
+
+768
+
+For every layer L from 0 through 11:
+
+File
+
+Purpose
+
+Expected elements
+
+transformer.h.L.ln_1.weight.txt
+
+Attention LayerNorm scale
+
+768
+
+transformer.h.L.ln_1.bias.txt
+
+Attention LayerNorm bias
+
+768
+
+transformer.h.L.attn.c_attn.weight.txt
+
+Combined QKV projection
+
+768 × 2304
+
+transformer.h.L.attn.c_attn.bias.txt
+
+Combined QKV bias
+
+2304
+
+transformer.h.L.attn.c_proj.weight.txt
+
+Attention output projection
+
+768 × 768
+
+transformer.h.L.attn.c_proj.bias.txt
+
+Attention output bias
+
+768
+
+transformer.h.L.ln_2.weight.txt
+
+MLP LayerNorm scale
+
+768
+
+transformer.h.L.ln_2.bias.txt
+
+MLP LayerNorm bias
+
+768
+
+transformer.h.L.mlp.c_fc.weight.txt
+
+MLP expansion
+
+768 × 3072
+
+transformer.h.L.mlp.c_fc.bias.txt
+
+MLP expansion bias
+
+3072
+
+transformer.h.L.mlp.c_proj.weight.txt
+
+MLP contraction
+
+3072 × 768
+
+transformer.h.L.mlp.c_proj.bias.txt
+
+MLP contraction bias
+
+768
+
+All tensors are loaded as flat float arrays.
+
+Numerical Details
+
+Float representation
+
+The inference engine stores tensors as:
+
+std::vector<float>
+
+so the primary numerical type is 32-bit floating point.
+
+This keeps the implementation simple and avoids introducing a separate half-precision or quantized runtime.
+
+LayerNorm epsilon
+
+LayerNorm uses:
+
+constexpr float EPSILON = 1e-5f;
+
+inside:
+
+sqrt(variance + epsilon)
+
+to avoid numerical instability from division by zero or extremely small denominators.
+
+Stable softmax
+
+Instead of directly evaluating:
+
+exp(x)
+
+the implementation subtracts the maximum input first:
+
+exp(x - max(x))
+
+The resulting softmax distribution is mathematically equivalent while being safer numerically.
+
+Generation and Context Management
+
+GPT-2 has a maximum context length of:
+
+1024 tokens
+
+The source enforces this in two places.
+
+forward()
+
+The forward function rejects sequences longer than 1024.
+
+main()
+
+Before generation, main() truncates the prompt to:
+
+MAX_CONTEXT - 1
+
+when necessary.
+
+It then limits generation using:
+
+std::min(
+    maxNewTokens,
+    MAX_CONTEXT - input_length
+)
+
+This ensures that the generated sequence never exceeds the model's configured context size during the REPL session.
+
+Build
+
+The project requires a C++17-capable compiler.
+
+A build from the repository root can use:
+
+mkdir -p build
+
+g++ \
+  -std=c++17 \
+  -O3 \
+  -I . \
+  -o build/gpt2_infer \
+  src/main.cpp
+
+The -I . include path matches the source's current include:
+
+#include "include/json.hpp"
+
+If your local layout differs, adjust the include path or source include accordingly.
+
+Run
+
+The executable expects the process working directory to make:
+
+../weights
+
+resolve correctly.
+
+With the layout:
+
 project-root/
 ├── weights/
 └── build/
     └── gpt2_infer
-```
 
-Run:
+run:
 
-```bash
 cd build
 ./gpt2_infer
-```
 
-To use a specific Python interpreter:
+To use another Python interpreter:
 
-```bash
 GPT2_PYTHON=python3.11 ./gpt2_infer
-```
 
----
+Requirements
 
-# 33. Example Inference Flow
+C++
 
-Given:
+C++17-compatible compiler
 
-```text
+GCC or Clang
+
+JSON
+
+nlohmann/json
+
+The single-header file is expected at:
+
+include/json.hpp
+
+Python
+
+Python 3 with Hugging Face tokenizers:
+
+pip install tokenizers
+
+Model assets
+
+You need:
+
+GPT-2 Small / 124M weights
+
+the expected text tensor files
+
+weights/tokenizer/tokenizer.json
+
+The weight export format must match the tensor order and dimensions expected by the C++ implementation.
+
+Example
+
+Start the executable:
+
+GPT-2 124M CPU Inference Engine
+================================
+Type 'exit' to quit.
+
 Prompt:
-The quick brown fox
-```
 
-the complete process is:
+Enter:
 
-```text
-"The quick brown fox"
-            │
-            ▼
-       GPT-2 Tokenizer
-            │
-            ▼
-      Token IDs
-            │
-            ▼
-     Token Embeddings
-            +
-    Position Embeddings
-            │
-            ▼
-     Transformer Block 0
-            │
-            ▼
-     Transformer Block 1
-            │
-            ▼
-            ...
-            │
-            ▼
-     Transformer Block 11
-            │
-            ▼
-       Final LayerNorm
-            │
-            ▼
-      Vocabulary Projection
-            │
-            ▼
-       50,257 logits
-            │
-            ▼
-        argmax()
-            │
-            ▼
-       Next Token
-            │
-            ▼
-     Append to sequence
-            │
-            └───────────► Repeat
-```
+The quick brown
 
-This is the core inference loop implemented by the project.
+Then:
 
----
+Number of new tokens: 5
 
-# 34. What Is Actually Being Computed?
+The engine will:
 
-At a high level, the model performs a function:
+1. Encode the prompt
+2. Print the input token IDs
+3. Run GPT-2 forward
+4. Select the highest-scoring token
+5. Append it to the context
+6. Run forward again
+7. Repeat until 5 tokens are generated
+8. Decode the complete token sequence
 
-```text
-f(tokens) → logits
-```
+The exact generated text depends on the supplied GPT-2 weights and tokenizer.
 
-For a sequence:
+Performance
 
-```text
-[t₁, t₂, ..., tₙ]
-```
+This implementation intentionally favors readability over throughput.
 
-GPT-2 produces a hidden representation for every position:
+The current code is:
 
-```text
-H = [h₁, h₂, ..., hₙ]
-```
-
-The final hidden state:
-
-```text
-hₙ
-```
-
-contains information aggregated from the preceding context.
-
-The vocabulary projection then produces:
-
-```text
-L = hₙ WTEᵀ
-```
-
-where:
-
-```text
-L ∈ R^50257
-```
-
-The engine chooses:
-
-```text
-argmax(L)
-```
-
-as the next token.
-
-This is the fundamental operation repeated during text generation.
-
----
-
-# 35. What the Model "Knows"
-
-The engine does not contain explicit rules such as:
-
-```text
-if sentence contains "hello":
-    respond with "hi"
-```
-
-Instead, behavior emerges from numerical parameters learned during training.
-
-The weights encode statistical relationships between tokens.
-
-During inference, the model transforms the current context through many layers of matrix operations until the final representation contains information useful for predicting the next token.
-
-The inference engine's job is simply to execute those transformations accurately.
-
----
-
-# 36. Performance Characteristics
-
-This implementation prioritizes **clarity and transparency over performance**.
-
-The current engine is:
-
-```text
-CPU
+CPU only
 Single-threaded
 Unbatched
-Naive matrix multiplication
-No SIMD optimization
+Plain C++ loops
+float32 tensors
+No SIMD kernels
 No BLAS
-No GPU acceleration
+No GPU backend
 No KV cache
-```
+Plain-text weight loading
+External Python tokenizer process
 
-The result is a deliberately simple implementation that exposes the actual Transformer computations.
+The largest cost comes from repeated matrix operations and from recomputing the full sequence during autoregressive generation.
 
-A production inference runtime would normally introduce substantially more optimization.
+The implementation is therefore best viewed as an educational/reference inference engine, not as a replacement for optimized runtimes.
 
----
+Why Generation Gets Slower
 
-# 37. Known Limitations
+The current generation path performs:
 
-### Greedy Decoding Only
+Step 1:
+forward(prompt)
 
-The current implementation selects:
+Step 2:
+forward(prompt + token_1)
 
-```text
-argmax(logits)
-```
+Step 3:
+forward(prompt + token_1 + token_2)
 
-and therefore does not currently support:
+Step 4:
+forward(prompt + token_1 + token_2 + token_3)
 
-* temperature
-* top-k sampling
-* top-p / nucleus sampling
-* repetition penalties
-* beam search
+...
 
----
+Nothing is cached between steps.
 
-### No KV Cache
+In particular, previously computed attention keys and values are recomputed.
 
-Every generation step recomputes attention for the entire current sequence.
+A production runtime would typically use a KV cache:
 
-This increases computational cost as the context grows.
+Past tokens
+   │
+   ├── cached K
+   └── cached V
 
----
+New token
+   │
+   ▼
+compute only new K/V
+   │
+   ▼
+reuse cached history
 
-### CPU Only
+That is one of the major performance improvements that could be added to this project.
 
-The engine currently runs on the CPU.
+Limitations
 
-There is no:
+Greedy-only decoding
 
-* CUDA backend
-* GPU kernel implementation
-* Metal backend
-* accelerator support
+Current decoding is:
 
----
+nextToken = argmax(logits);
 
-### Single-Threaded
+There is no stochastic sampling.
 
-Inference is performed by a single execution thread.
+Unsupported decoding strategies include:
 
-There is currently no explicit parallelism across:
+temperature
 
-* tokens
-* attention heads
-* matrix operations
-* transformer layers
+top-k
 
----
+top-p / nucleus sampling
 
-### No SIMD / BLAS Optimization
+repetition penalty
 
-Matrix operations use straightforward C++ loops rather than optimized numerical libraries.
+beam search
 
-This makes the implementation easier to understand but significantly less efficient than optimized inference runtimes.
+No KV cache
 
----
+The engine recomputes the Transformer for the whole current context at each generation step.
 
-### External Tokenizer Process
+CPU only
 
-Tokenization is performed through a Python subprocess rather than an in-process C++ tokenizer.
+There is no CUDA, GPU, or accelerator backend.
 
-The current implementation communicates through temporary files.
+Single-threaded
 
-This introduces process and I/O overhead.
+The current implementation does not explicitly parallelize matrix operations, attention heads, or token positions.
 
----
+Naive matrix multiplication
 
-### GPT-2 Small Only
+linear() uses direct nested loops rather than optimized numerical kernels.
 
-The current implementation is specialized for GPT-2 Small / 124M:
+Plain-text weights
 
-```text
+Human-readable tensor files are convenient for inspection but are much larger and slower to load than a binary representation.
+
+External tokenizer process
+
+Encoding and decoding launch Python subprocesses and use temporary files.
+
+This adds overhead and requires Python to be installed at runtime.
+
+GPT-2 Small only
+
+The architecture is hardcoded for:
+
+50257 vocab
+768 hidden
 12 layers
-768 hidden dimensions
 12 heads
-3072 MLP dimensions
-1024-token context
-50257-token vocabulary
-```
+64 head dimension
+3072 MLP
+1024 context
 
-Supporting GPT-2 Medium, Large, or XL would require adapting the architecture and loading logic to their respective tensor shapes.
+Supporting other GPT-2 sizes requires generalized configuration and compatible weight files.
 
----
+Future Work
 
-### Plain-Text Weight Files
+The code is intentionally structured so that major inference improvements can be added incrementally.
 
-Weights are stored as human-readable text files.
+Potential extensions include:
 
-This makes the files easy to inspect but significantly increases storage size and loading overhead compared with binary formats.
+1. KV cache
 
----
+Avoid recomputing previous keys and values during generation.
 
-# 38. Potential Future Improvements
+2. Optimized matrix kernels
 
-Several extensions could turn the project into a significantly more capable inference runtime:
+Replace the naive linear() implementation with:
 
-```text
-KV cache
-    ↓
-SIMD-optimized kernels
-    ↓
-Multithreaded execution
-    ↓
-BLAS integration
-    ↓
-Binary weight format
-    ↓
-Memory-mapped weights
-    ↓
-In-process C++ tokenizer
-    ↓
-Temperature sampling
-    ↓
-Top-k / Top-p sampling
-    ↓
-Repetition penalty
-    ↓
-Batch inference
-    ↓
-Support for additional GPT-2 model sizes
-    ↓
-GPU backend
-```
+SIMD
 
-A particularly important next optimization is **KV caching**, since it removes repeated computation of keys and values for tokens that have already been processed.
+cache-aware kernels
 
----
+BLAS
 
-# 39. Learning Objectives
+threaded matrix multiplication
 
-This project provides a practical implementation of several concepts that are often abstracted away by ML frameworks:
+3. Binary weight format
 
-* Transformer architecture
-* GPT-2 internals
-* tokenization
-* embeddings
-* matrix multiplication
-* LayerNorm
-* residual networks
-* multi-head attention
-* causal masking
-* softmax
-* GELU
-* autoregressive generation
-* weight loading
-* CPU inference
-* tensor memory layout
+Replace whitespace-separated text files with a compact binary representation.
 
-The implementation is intentionally close to the underlying mathematical structure of GPT-2.
+4. Memory mapping
 
----
+Allow large weight tensors to be memory-mapped rather than fully parsed from text.
 
-# 40. Project Philosophy
+5. Native C++ tokenizer
 
-The project follows a simple principle:
+Remove the Python subprocess and temporary-file round trip.
 
-> **Do not hide the computation. Implement it.**
+6. Sampling
 
-Instead of treating GPT-2 as a black box, this engine makes the inference process explicit from input text to generated token.
+Add:
 
-The project is therefore less about building another production-ready chatbot and more about understanding what a Transformer inference engine actually has to execute.
+temperature
+top-k
+top-p
+repetition penalty
 
----
+7. Batch inference
 
-# 41. Tech Stack
+Support multiple prompts at once.
 
-```text
-Language       C++17
-Runtime        Native CPU
-Model          GPT-2 Small (124M)
-Tokenizer      Hugging Face tokenizers
-Configuration  JSON
-Compiler       GCC / Clang
-Optimization   -O3
-```
+8. Model configuration
 
----
+Replace compile-time GPT-2 constants with runtime model metadata.
 
-# 42. License
+9. GPU backend
 
-Add the license for this repository here.
+Introduce CUDA or another accelerator backend after the CPU reference implementation is optimized and validated.
 
-For example:
+Design Decisions
 
-```text
-MIT License
-```
+Why std::vector<float>?
 
-if the repository is intended to be released under MIT.
+It keeps the implementation understandable.
 
----
+The project does not need a custom tensor framework to demonstrate the core operations.
 
-# 43. Summary
+Why one linear() function?
 
-This project implements the GPT-2 inference pipeline directly in C++:
+Attention projections and MLP projections all reduce to:
 
-```text
-                 USER PROMPT
-                      │
-                      ▼
-                  TOKENIZER
-                      │
-                      ▼
-                  TOKEN IDs
-                      │
-                      ▼
-             TOKEN + POSITION
-                EMBEDDINGS
-                      │
-                      ▼
-              ┌──────────────┐
-              │ Transformer  │
-              │   Block ×12  │
-              └──────────────┘
-                      │
-                      ▼
-                FINAL NORM
-                      │
-                      ▼
-               LOGIT PROJECTION
-                      │
-                      ▼
-                50,257 LOGITS
-                      │
-                      ▼
-                  ARGMAX
-                      │
-                      ▼
-                NEXT TOKEN
-                      │
-                      ▼
-             APPEND TO CONTEXT
-                      │
-                      └───────────┐
-                                  │
-                                  ▼
-                               REPEAT
-```
+y = xW + b
 
-At its core, the engine performs one job:
+Using one primitive avoids duplicated matrix-multiplication code.
 
-```text
-Given a sequence of tokens,
-compute the numerical representation of that sequence,
-produce a score for every possible next token,
-select the next token,
-and repeat.
-```
+Why compute Q, K and V together?
 
-Everything between the input string and that next-token decision is implemented explicitly in C++.
+GPT-2's attention projection is stored as one combined c_attn matrix.
+
+Therefore the implementation computes:
+
+QKV = XW + b
+
+once and splits the result into Q, K and V.
+
+Why use Python for tokenization?
+
+The C++ project focuses on model inference.
+
+Using the provided Hugging Face tokenizer keeps the tokenization path aligned with the reference GPT-2 tokenizer rather than maintaining a second BPE implementation in C++.
+
+Why use plain-text weights?
+
+It makes the tensors easy to inspect and debug.
+
+The tradeoff is significantly larger files and slower loading.
+
+Full Inference Pipeline
+
+The entire program can be summarized as:
+
+                           USER
+                            │
+                            ▼
+                     Text Prompt
+                            │
+                            ▼
+                     encodeExact()
+                            │
+                            ▼
+                        Token IDs
+                            │
+                            ▼
+                 Token + Position Embeddings
+                            │
+                            ▼
+                 ┌─────────────────────────┐
+                 │ Transformer Block × 12  │
+                 │                         │
+                 │ LayerNorm                │
+                 │    ↓                    │
+                 │ QKV Projection          │
+                 │    ↓                    │
+                 │ 12 Attention Heads      │
+                 │    ↓                    │
+                 │ Causal Attention        │
+                 │    ↓                    │
+                 │ Output Projection       │
+                 │    ↓                    │
+                 │ Residual                │
+                 │    ↓                    │
+                 │ LayerNorm                │
+                 │    ↓                    │
+                 │ MLP 768→3072→768        │
+                 │    ↓                    │
+                 │ Residual                │
+                 └────────────┬────────────┘
+                              │
+                              ▼
+                       Final LayerNorm
+                              │
+                              ▼
+                 Vocabulary Projection
+                     using WTEᵀ
+                              │
+                              ▼
+                       50,257 Logits
+                              │
+                              ▼
+                          argmax()
+                              │
+                              ▼
+                         Next Token
+                              │
+                              ▼
+                       append token
+                              │
+                              └───────────────┐
+                                              │
+                                              ▼
+                                         forward()
+                                          again
+
+The Core Idea in One Function
+
+The most important conceptual function is forward().
+
+At a high level, it implements:
+
+tokens
+  ↓
+embeddings
+  ↓
+Transformer × 12
+  ↓
+final hidden state
+  ↓
+vocabulary scores
+
+or mathematically:
+
+H₀ = WTE(tokens) + WPE(positions)
+
+H₁  = Block₀(H₀)
+H₂  = Block₁(H₁)
+...
+H₁₂ = Block₁₁(H₁₁)
+
+h = LayerNorm(H₁₂[last_position])
+
+logits = h × WTEᵀ
+
+The decoding layer then performs:
+
+next_token = argmax(logits)
+
+Generation repeats this computation after appending the newly selected token.
+
+That is the entire inference engine in conceptual form.
+
+Understanding the Code in Reading Order
+
+For someone reading the source for the first time, the recommended order is:
+
+1. Constants / Tensor
+        ↓
+2. loadTensor()
+        ↓
+3. Block
+        ↓
+4. GPT2::load()
+        ↓
+5. layerNorm()
+        ↓
+6. linear()
+        ↓
+7. gelu()
+        ↓
+8. softmax()
+        ↓
+9. attention()
+        ↓
+10. mlp()
+        ↓
+11. transformerBlock()
+        ↓
+12. forward()
+        ↓
+13. argmax()
+        ↓
+14. Tokenizer
+        ↓
+15. encodeExact() / decodeExact()
+        ↓
+16. main()
+
+This order mirrors the dependency structure of the implementation.
+
+Start with the small mathematical primitives, then move upward into attention, then the Transformer block, then the complete forward pass, and finally the REPL and generation loop.
+
+What Makes This an Inference Engine?
+
+The program does not "understand text" through a collection of handwritten rules.
+
+There is no logic such as:
+
+if (prompt contains "hello")
+    return "hi";
+
+Instead, the behavior comes from the learned numerical parameters.
+
+The C++ engine's responsibility is to execute those parameters through the GPT-2 computation graph correctly.
+
+That means the project sits at the boundary between:
+
+Model parameters
+      +
+Model architecture
+      +
+Numerical kernels
+      ↓
+Inference
+
+The model weights provide the learned behavior.
+
+The Transformer architecture defines how those weights are used.
+
+The C++ implementation performs the arithmetic.
+
+Educational Value
+
+This project is useful for studying:
+
+Transformer architecture
+
+GPT-2 internals
+
+autoregressive language modeling
+
+attention
+
+causal masking
+
+embeddings
+
+matrix multiplication
+
+LayerNorm
+
+residual connections
+
+feed-forward networks
+
+softmax
+
+tokenization
+
+model weight formats
+
+CPU inference
+
+memory layout
+
+inference bottlenecks
+
+KV-cache design
+
+The implementation intentionally keeps these concepts visible instead of hiding them behind a framework.
+
+License
